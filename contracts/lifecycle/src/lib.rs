@@ -1,5 +1,5 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_with_error, symbol_short, Address, Env, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -10,6 +10,24 @@ pub struct MaintenanceRecord {
     pub engineer: Address,
     pub timestamp: u64,
 }
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Config {
+    pub admin: Address,
+    pub collateral_threshold: u32,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    Unauthorized = 3,
+}
+
+const CONFIG: Symbol = symbol_short!("CONFIG");
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -24,6 +42,27 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    pub fn initialize(env: Env, admin: Address, collateral_threshold: u32) {
+        if env.storage().instance().has(&CONFIG) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&CONFIG, &Config { admin, collateral_threshold });
+    }
+
+    pub fn set_threshold(env: Env, caller: Address, new_threshold: u32) {
+        caller.require_auth();
+        let mut config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if config.admin != caller {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        config.collateral_threshold = new_threshold;
+        env.storage().instance().set(&CONFIG, &config);
+    }
+
     pub fn submit_maintenance(
         env: Env,
         asset_id: u64,
@@ -82,7 +121,13 @@ impl Lifecycle {
     }
 
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
-        Self::get_collateral_score(env, asset_id) >= 50
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .map(|c: Config| c.collateral_threshold)
+            .unwrap_or(50);
+        Self::get_collateral_score(env, asset_id) >= threshold
     }
 }
 
@@ -91,13 +136,19 @@ mod tests {
     use super::*;
     use soroban_sdk::{symbol_short, testutils::Address as _, Env, String};
 
-    #[test]
-    fn test_submit_and_score() {
+    fn setup() -> (Env, soroban_sdk::Address, LifecycleClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(Lifecycle, ());
         let client = LifecycleClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &50);
+        (env, admin, client)
+    }
 
+    #[test]
+    fn test_submit_and_score() {
+        let (env, _, client) = setup();
         let engineer = Address::generate(&env);
 
         for _ in 0..10 {
@@ -112,5 +163,45 @@ mod tests {
         assert_eq!(client.get_collateral_score(&1u64), 50);
         assert!(client.is_collateral_eligible(&1u64));
         assert_eq!(client.get_maintenance_history(&1u64).len(), 10);
+    }
+
+    #[test]
+    fn test_set_threshold_updates_eligibility() {
+        let (env, admin, client) = setup();
+        let engineer = Address::generate(&env);
+
+        // 10 records → score 50, eligible at threshold 50
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &2u64,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+            );
+        }
+        assert!(client.is_collateral_eligible(&2u64));
+
+        // raise threshold to 75 — same score now ineligible
+        client.set_threshold(&admin, &75);
+        assert!(!client.is_collateral_eligible(&2u64));
+
+        // lower threshold to 25 — eligible again
+        client.set_threshold(&admin, &25);
+        assert!(client.is_collateral_eligible(&2u64));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_threshold_rejects_non_admin() {
+        let (env, _, client) = setup();
+        let non_admin = Address::generate(&env);
+        client.set_threshold(&non_admin, &10);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initialize_twice_panics() {
+        let (_env, admin, client) = setup();
+        client.initialize(&admin, &60);
     }
 }
