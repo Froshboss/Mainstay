@@ -27,6 +27,7 @@ impl EngineerRegistry {
         issuer: Address,
     ) {
         issuer.require_auth();
+        assert!(credential_hash != BytesN::from_array(&env, &[0u8; 32]), "credential hash cannot be zero");
         let record = Engineer {
             address: engineer.clone(),
             credential_hash,
@@ -92,5 +93,20 @@ mod tests {
 
         client.revoke_credential(&engineer, &issuer);
         assert!(!client.verify_engineer(&engineer));
+    }
+
+    #[test]
+    #[should_panic(expected = "credential hash cannot be zero")]
+    fn test_register_zero_hash_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.register_engineer(&engineer, &zero_hash, &issuer);
     }
 }
