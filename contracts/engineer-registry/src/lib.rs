@@ -34,7 +34,10 @@ impl EngineerRegistry {
         issuer: Address,
     ) {
         issuer.require_auth();
-        assert!(credential_hash != BytesN::from_array(&env, &[0u8; 32]), "credential hash cannot be zero");
+        assert!(
+            credential_hash != BytesN::from_array(&env, &[0u8; 32]),
+            "credential hash cannot be zero"
+        );
         let record = Engineer {
             address: engineer.clone(),
             credential_hash,
@@ -42,7 +45,9 @@ impl EngineerRegistry {
             active: true,
             issued_at: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
     }
 
     pub fn verify_engineer(env: Env, engineer: Address) -> bool {
@@ -63,7 +68,9 @@ impl EngineerRegistry {
         assert!(record.issuer == issuer, "not the issuer");
         assert!(record.active, "credential already revoked");
         record.active = false;
-        env.storage().persistent().set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
     }
 
     pub fn get_engineer(env: Env, engineer: Address) -> Engineer {
