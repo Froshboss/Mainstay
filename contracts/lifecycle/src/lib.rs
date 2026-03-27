@@ -25,6 +25,13 @@ pub struct MaintenanceRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecord {
+    pub task_type: Symbol,
+    pub notes: String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
     pub max_history: u32,
@@ -220,6 +227,79 @@ impl Lifecycle {
             (symbol_short!("MAINT"), asset_id),
             (task_type, engineer, env.ledger().timestamp())
         );
+    }
+
+    /// Submit multiple maintenance records for the same asset in a single transaction.
+    /// All records are validated before any are written.
+    pub fn batch_submit_maintenance(
+        env: Env,
+        asset_id: u64,
+        records: Vec<BatchRecord>,
+        engineer: Address,
+    ) {
+        engineer.require_auth();
+
+        // Validate asset exists
+        let asset_registry: Address = env
+            .storage()
+            .instance()
+            .get(&ASSET_REGISTRY)
+            .expect("asset registry not set");
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        asset_registry_client.get_asset(&asset_id);
+
+        // Validate engineer credential
+        let engineer_registry: Address = env
+            .storage()
+            .instance()
+            .get(&ENG_REGISTRY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedEngineer));
+        let engineer_registry_client =
+            engineer_registry_client::EngineerRegistryClient::new(&env, &engineer_registry);
+        if !engineer_registry_client.verify_engineer(&engineer) {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        }
+
+        let mut history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set");
+
+        // Validate all records fit before writing any
+        if history.len() + records.len() > config.max_history {
+            panic!("history cap reached");
+        }
+
+        // Write all records
+        let timestamp = env.ledger().timestamp();
+        let mut score: u32 = env
+            .storage()
+            .persistent()
+            .get(&score_key(asset_id))
+            .unwrap_or(0u32);
+
+        for record in records.iter() {
+            let weight = get_task_weight(&env, &record.task_type);
+            score = (score + weight).min(100);
+            history.push_back(MaintenanceRecord {
+                asset_id,
+                task_type: record.task_type.clone(),
+                notes: record.notes.clone(),
+                engineer: engineer.clone(),
+                timestamp,
+            });
+        }
+
+        env.storage().persistent().set(&history_key(asset_id), &history);
+        env.storage().persistent().set(&score_key(asset_id), &score);
+        env.storage().persistent().set(&last_update_key(asset_id), &timestamp);
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -671,5 +751,111 @@ mod tests {
         // Verify TTL is set for score storage entry
         let score_ttl = env.storage().persistent().get_ttl(&score_key(asset_id));
         assert!(score_ttl > 0, "Score TTL should be extended");
+    }
+
+    #[test]
+    fn test_batch_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Oil change"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INSPECT"),
+            notes: String::from_str(&env, "Inspection"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("ENGINE"),
+            notes: String::from_str(&env, "Engine repair"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        // OIL_CHG=2, INSPECT=2, ENGINE=10 => 14
+        assert_eq!(client.get_collateral_score(&asset_id), 14);
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "history cap reached")]
+    fn test_batch_submit_exceeds_history_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 2);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "First"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Second"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Third - over cap"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+    }
+
+    #[test]
+    fn test_batch_submit_unauthorized_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let unregistered = Address::generate(&env);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "Should fail"),
+        });
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &unregistered);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_revoked_engineer_should_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        engineer_registry_client.revoke_credential(&engineer);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Post-revocation attempt"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+        );
     }
 }
