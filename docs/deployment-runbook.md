@@ -55,17 +55,47 @@ stellar contract invoke --id LC_ID --network testnet --source deployer -- initia
   --max_history 200
 ```
 
-## 4. TTL Maintenance Considerations
+## 4. Post-Deployment Verification
+Once initialized, verify the contract state and availability.
 
-Critical project data (asset records, histories) are stored as **persistent entries**.
+### 4.1 Verify Asset Registry
+Confirm the registry is responsive and the admin is correctly set:
+```bash
+stellar contract invoke --id AR_ID --network testnet --source any -- get_admin
+```
 
-### 4.1 Initial TTL Verification
+### 4.2 Verify Engineer Registry
+Confirm the registry is responsive and the admin is correctly set:
+```bash
+stellar contract invoke --id ER_ID --network testnet --source any -- get_admin
+```
+
+### 4.3 Verify Lifecycle Binding
+Confirm that Lifecycle can reach the Asset Registry (this triggers a cross-contract call):
+```bash
+# Attempt to get a non-existent asset; should return a contract error (not a panic)
+stellar contract invoke --id LC_ID --network testnet --source any -- get_collateral_score --asset_id 999
+```
+
+## 5. Monitoring Recommendations
+Mainstay contracts are critical for asset financing. Active monitoring is recommended.
+
+### 5.1 Event Monitoring
+Subscribe to contract events to track lifecycle transitions:
+- `REG_AST`: Asset registration.
+- `MAINT`: Maintenance record submissions.
+- `DECAY`: Score decay updates.
+
+### 5.2 Storage Expiration (TTL)
+The project relies on **persistent storage** for all metadata and histories.
+
+#### 5.2.1 Initial TTL Verification
 Verify that the instance storage for all three contracts is extended past 30 days:
 ```bash
 stellar contract storage extend --id LC_ID --network testnet --durability instance --ledgers-to-extend 518400
 ```
 
-### 4.2 Ongoing Monitoring
+#### 5.2.2 Ongoing TTL Monitoring
 If a contract remains inactive for long periods (near 30 days), persistent entries must be manually extended using the `stellar contract storage extend` command to prevent data loss.
 
 Refer to [docs/ttl-strategy.md](ttl-strategy.md) for a full mapping of storage keys.
