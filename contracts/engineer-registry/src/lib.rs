@@ -6,6 +6,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_wit
 #[repr(u32)]
 pub enum ContractError {
     CredentialAlreadyRevoked = 1,
+    UnauthorizedAdmin = 2,
 }
 
 #[contracttype]
@@ -121,6 +122,22 @@ impl EngineerRegistry {
         }
         env.storage().instance().remove(&trusted_key(&issuer));
     }
+
+    /// Admin-only: upgrade the contract WASM to a new hash.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .expect("admin not initialized");
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +219,43 @@ mod tests {
         // Verify TTL is still set after revoke
         let engineer_ttl = env.storage().persistent().get_ttl(&engineer_key(&engineer));
         assert!(engineer_ttl > 0, "Engineer TTL should be extended after revoke");
+    }
+
+    #[test]
+    fn test_admin_can_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        // Should not panic — admin is authorized
+        client.upgrade(&admin, &new_wasm_hash);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let outsider = Address::generate(&env);
+        let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+
+        let result = client.try_upgrade(&outsider, &new_wasm_hash);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }
 

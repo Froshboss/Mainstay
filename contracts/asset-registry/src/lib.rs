@@ -10,9 +10,8 @@ use soroban_sdk::{
 pub enum ContractError {
     AssetNotFound = 1,
     /// Same owner attempted to register an asset with identical metadata.
-    /// Each physical asset should have unique metadata (serial number, model, etc.).
-    /// If re-registration is intentional, use distinct metadata to distinguish assets.
     DuplicateAsset = 2,
+    UnauthorizedAdmin = 3,
 }
 
 #[contracttype]
@@ -130,6 +129,22 @@ impl AssetRegistry {
             (symbol_short!("DEREG_AST"), asset_id),
             (asset.asset_type.clone(), asset.owner.clone())
         );
+    }
+
+    /// Admin-only: upgrade the contract WASM to a new hash.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .expect("admin not initialized");
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
 
@@ -262,6 +277,43 @@ mod tests {
         let dk = dedup_key(&owner, &meta_hash);
         let dedup_ttl = env.storage().persistent().get_ttl(&dk);
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
+    }
+
+    #[test]
+    fn test_admin_can_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        // Should not panic — admin is authorized
+        client.upgrade(&admin, &new_wasm_hash);
+    }
+
+    #[test]
+    fn test_non_admin_cannot_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let outsider = Address::generate(&env);
+        let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
+
+        let result = client.try_upgrade(&outsider, &new_wasm_hash);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }
 
